@@ -188,7 +188,7 @@ defmodule Membrane.RTSP.Source do
     else
       case ConnectionManager.keep_alive(state) do
         {:ok, state} -> {[], state}
-        {:error, reason} -> {[terminate: {:keep_alive_failed, reason}], state}
+        {:error, reason} -> {[terminate: {:shutdown, {:keep_alive_failed, reason}}], state}
       end
     end
   end
