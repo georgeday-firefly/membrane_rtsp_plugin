@@ -315,8 +315,8 @@ defmodule Membrane.RTSP.Source do
 
   @spec parser(ChildrenSpec.builder(), ConnectionManager.track()) :: ChildrenSpec.builder()
   defp parser(link_builder, %{rtpmap: %{encoding: "H264"}} = track) do
-    sps = track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.sps
-    pps = track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.pps
+    sps = track.fmtp && track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.sps
+    pps = track.fmtp && track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.pps
 
     child(link_builder, {:parser, make_ref()}, %Membrane.H264.Parser{
       spss: List.wrap(sps),
