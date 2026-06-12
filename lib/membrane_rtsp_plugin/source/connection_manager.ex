@@ -59,13 +59,27 @@ defmodule Membrane.RTSP.Source.ConnectionManager do
     end
   end
 
+  @max_keep_alive_timeouts 1
+
   @spec keep_alive(State.t()) :: {:ok, State.t()} | {:error, term()}
   def keep_alive(state) do
     Membrane.Logger.debug("Send GET_PARAMETER to keep session alive")
 
     case RTSP.get_parameter(state.rtsp_session) do
       {:ok, %{status: 200}} ->
-        {:ok, %{state | keep_alive_timer: start_keep_alive_timer(state)}}
+        {:ok, %{state | keep_alive_timer: start_keep_alive_timer(state), keep_alive_timeouts: 0}}
+
+      {:error, :timeout} when state.keep_alive_timeouts < @max_keep_alive_timeouts ->
+        Membrane.Logger.warning(
+          "RTSP keep-alive timed out, retrying (#{state.keep_alive_timeouts + 1}/#{@max_keep_alive_timeouts + 1})"
+        )
+
+        {:ok,
+         %{
+           state
+           | keep_alive_timer: start_keep_alive_timer(state),
+             keep_alive_timeouts: state.keep_alive_timeouts + 1
+         }}
 
       error ->
         Membrane.Logger.error("RTSP keep-alive failed: #{inspect(error)}")

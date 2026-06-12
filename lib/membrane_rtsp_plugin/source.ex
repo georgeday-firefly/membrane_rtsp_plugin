@@ -99,6 +99,7 @@ defmodule Membrane.RTSP.Source do
             tracks: [ConnectionManager.track()],
             rtsp_session: Membrane.RTSP.t() | nil,
             keep_alive_timer: reference() | nil,
+            keep_alive_timeouts: non_neg_integer(),
             on_connection_closed: :raise_error | :send_eos,
             end_of_stream: boolean(),
             play_request_sent: boolean()
@@ -118,6 +119,7 @@ defmodule Membrane.RTSP.Source do
                   ssrc_to_track: %{},
                   rtsp_session: nil,
                   keep_alive_timer: nil,
+                  keep_alive_timeouts: 0,
                   end_of_stream: false,
                   play_request_sent: false
                 ]
