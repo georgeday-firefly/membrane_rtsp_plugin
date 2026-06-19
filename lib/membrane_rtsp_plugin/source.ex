@@ -99,7 +99,6 @@ defmodule Membrane.RTSP.Source do
             tracks: [ConnectionManager.track()],
             rtsp_session: Membrane.RTSP.t() | nil,
             keep_alive_timer: reference() | nil,
-            keep_alive_timeouts: non_neg_integer(),
             on_connection_closed: :raise_error | :send_eos,
             end_of_stream: boolean(),
             play_request_sent: boolean()
@@ -119,7 +118,6 @@ defmodule Membrane.RTSP.Source do
                   ssrc_to_track: %{},
                   rtsp_session: nil,
                   keep_alive_timer: nil,
-                  keep_alive_timeouts: 0,
                   end_of_stream: false,
                   play_request_sent: false
                 ]
@@ -242,6 +240,15 @@ defmodule Membrane.RTSP.Source do
 
   @spec create_sources_spec(State.t()) :: Membrane.ChildrenSpec.t()
   defp create_sources_spec(state) do
+    payload_type_mapping =
+      Map.new(
+        state.tracks,
+        fn %{rtpmap: rtpmap} ->
+          {rtpmap.payload_type,
+           %{encoding_name: String.to_atom(rtpmap.encoding), clock_rate: rtpmap.clock_rate}}
+        end
+      )
+
     case state.transport do
       :tcp ->
         {:tcp, socket} = List.first(state.tracks).transport
@@ -252,7 +259,7 @@ defmodule Membrane.RTSP.Source do
           on_connection_closed: state.on_connection_closed
         })
         |> child(:tcp_decapsulator, %RTSP.TCP.Decapsulator{rtsp_session: state.rtsp_session})
-        |> child(:rtp_demuxer, Membrane.RTP.Demuxer)
+        |> child(:rtp_demuxer, %Membrane.RTP.Demuxer{payload_type_mapping: payload_type_mapping})
 
       {:udp, _port_range_start, _port_range_end} ->
         [
@@ -261,9 +268,15 @@ defmodule Membrane.RTSP.Source do
 
             [
               child({:udp_source, rtp_port}, %Membrane.UDP.Source{local_port_no: rtp_port})
-              |> child({:rtp_demuxer, track.control_path}, Membrane.RTP.Demuxer),
+              |> child(
+                {:rtp_demuxer, track.control_path},
+                %Membrane.RTP.Demuxer{payload_type_mapping: payload_type_mapping}
+              ),
               child({:udp_source, rtcp_port}, %Membrane.UDP.Source{local_port_no: rtcp_port})
-              |> child({:rtcp_demuxer, track.control_path}, Membrane.RTP.Demuxer)
+              |> child(
+                {:rtcp_demuxer, track.control_path},
+                %Membrane.RTP.Demuxer{payload_type_mapping: payload_type_mapping}
+              )
             ]
           end)
         ]
@@ -273,17 +286,17 @@ defmodule Membrane.RTSP.Source do
   @spec depayloader(ChildrenSpec.builder(), ConnectionManager.track()) :: ChildrenSpec.builder()
   defp depayloader(builder, track) do
     depayloader_definition =
-      case track do
-        %{rtpmap: %{encoding: "H264"}} ->
+      case {track.type, String.downcase(track.rtpmap.encoding)} do
+        {_type, "h264"} ->
           Membrane.RTP.H264.Depayloader
 
-        %{rtpmap: %{encoding: "H265"}} ->
+        {_type, "h265"} ->
           Membrane.RTP.H265.Depayloader
 
-        %{rtpmap: %{encoding: "opus"}} ->
+        {_type, "opus"} ->
           Membrane.RTP.Opus.Depayloader
 
-        %{type: :audio, rtpmap: %{encoding: "mpeg4-generic"}} ->
+        {:audio, "mpeg4-generic"} ->
           mode =
             case track.fmtp do
               %{mode: :AAC_hbr} -> :hbr
@@ -292,7 +305,7 @@ defmodule Membrane.RTSP.Source do
 
           %Membrane.RTP.AAC.Depayloader{mode: mode}
 
-        %{rtpmap: %{encoding: _other}} ->
+        {_type, _encoding} ->
           nil
       end
 
@@ -305,8 +318,8 @@ defmodule Membrane.RTSP.Source do
 
   @spec parser(ChildrenSpec.builder(), ConnectionManager.track()) :: ChildrenSpec.builder()
   defp parser(link_builder, %{rtpmap: %{encoding: "H264"}} = track) do
-    sps = track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.sps
-    pps = track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.pps
+    sps = track.fmtp && track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.sps
+    pps = track.fmtp && track.fmtp.sprop_parameter_sets && track.fmtp.sprop_parameter_sets.pps
 
     child(link_builder, {:parser, make_ref()}, %Membrane.H264.Parser{
       spss: List.wrap(sps),
