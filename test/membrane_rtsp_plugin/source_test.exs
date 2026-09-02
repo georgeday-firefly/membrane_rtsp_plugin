@@ -125,6 +125,8 @@ defmodule Membrane.RTSP.SourceTest do
       )
 
     assert_pipeline_notified(pid, :source, {:set_up_tracks, _tracks})
+    # The server only reports TEARDOWN once PLAY has gone through
+    assert_start_of_stream(pid, {:sink, _ref}, :input, 5_000)
     :ok = Membrane.Testing.Pipeline.terminate(pid)
 
     assert_receive :teardown, 2_000
