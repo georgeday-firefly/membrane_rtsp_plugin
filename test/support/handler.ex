@@ -57,6 +57,7 @@ defmodule Membrane.RTSP.RequestHandler do
 
   @impl true
   def handle_open_connection(conn, state) do
+    if pid = Process.whereis(:rtsp_conn_listener), do: send(pid, {:rtsp_conn, conn})
     %{state | socket: conn}
   end
 

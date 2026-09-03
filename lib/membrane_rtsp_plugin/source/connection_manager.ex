@@ -35,16 +35,28 @@ defmodule Membrane.RTSP.Source.ConnectionManager do
 
   @spec establish_connection(Membrane.UtilitySupervisor.t(), State.t()) :: State.t()
   def establish_connection(utility_supervisor, state) do
-    state =
-      with {:ok, state} <- start_rtsp_connection(utility_supervisor, state),
-           {:ok, state} <- get_rtsp_description(state),
-           {:ok, state} <- setup_rtsp_connection(state) do
-        state
-      else
-        {:error, reason, state} -> handle_rtsp_error(reason, state)
-      end
+    case try_establish_connection(utility_supervisor, state) do
+      {:ok, state} -> state
+      {:error, reason, state} -> handle_rtsp_error(reason, state)
+    end
+  end
 
-    state
+  @doc """
+  Like `establish_connection/2`, but returns `{:error, reason, state}` instead of
+  raising, so the caller can retry. The session is torn down on error.
+  """
+  @spec try_establish_connection(Membrane.UtilitySupervisor.t(), State.t()) ::
+          {:ok, State.t()} | {:error, term(), State.t()}
+  def try_establish_connection(utility_supervisor, state) do
+    with {:ok, state} <- start_rtsp_connection(utility_supervisor, state),
+         {:ok, state} <- get_rtsp_description(state),
+         {:ok, state} <- setup_rtsp_connection(state) do
+      {:ok, state}
+    else
+      {:error, reason, state} ->
+        teardown(state)
+        {:error, reason, %{state | rtsp_session: nil}}
+    end
   end
 
   @spec play(State.t()) :: State.t()
