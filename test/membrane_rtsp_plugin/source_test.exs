@@ -8,6 +8,21 @@ defmodule Membrane.RTSP.SourceTest do
 
   @moduletag :tmp_dir
 
+  defmodule NotifyingSink do
+    @moduledoc false
+    use Membrane.Sink
+
+    def_input_pad :input, accepted_format: _any
+    def_options id: [spec: term()]
+
+    @impl true
+    def handle_init(_ctx, opts), do: {[], %{id: opts.id}}
+
+    @impl true
+    def handle_buffer(:input, buffer, _ctx, state),
+      do: {[notify_parent: {:buffer, state.id, buffer.pts}], state}
+  end
+
   defmodule TestPipeline do
     @moduledoc false
 
@@ -27,10 +42,31 @@ defmodule Membrane.RTSP.SourceTest do
           stream_uri: "rtsp://localhost:#{opts[:port]}/",
           timeout: opts[:timeout] || Membrane.Time.seconds(15),
           keep_alive_interval: opts[:keep_alive_interval] || Membrane.Time.seconds(15),
-          on_connection_closed: :send_eos
+          on_connection_closed: opts[:on_connection_closed] || :send_eos,
+          reconnect_attempts: opts[:reconnect_attempts] || 0,
+          reconnect_delay: opts[:reconnect_delay] || Membrane.Time.seconds(1)
         })
 
-      {[spec: spec], %{dest_folder: opts[:dest_folder]}}
+      {[spec: spec], %{dest_folder: opts[:dest_folder], sink: opts[:sink] || :file}}
+    end
+
+    @impl true
+    def handle_child_notification(
+          {:set_up_tracks, tracks},
+          _element,
+          _ctx,
+          %{sink: :notify} = state
+        ) do
+      spec =
+        Enum.map(tracks, fn track ->
+          get_child(:source)
+          |> via_out(Pad.ref(:output, track.control_path))
+          |> child({:sink, track.control_path}, %Membrane.RTSP.SourceTest.NotifyingSink{
+            id: track.control_path
+          })
+        end)
+
+      {[spec: spec], state}
     end
 
     @impl true
@@ -130,6 +166,50 @@ defmodule Membrane.RTSP.SourceTest do
     :ok = Membrane.Testing.Pipeline.terminate(pid)
 
     assert_receive :teardown, 2_000
+  end
+
+  test "re-establishes the session in place after the server drops the connection",
+       %{server_port: port} do
+    Process.register(self(), :rtsp_conn_listener)
+
+    pid =
+      Membrane.Testing.Pipeline.start_link_supervised!(
+        module: TestPipeline,
+        custom_args: %{
+          port: port,
+          sink: :notify,
+          allowed_media_types: [:video],
+          on_connection_closed: :raise_error,
+          reconnect_attempts: 3,
+          reconnect_delay: Membrane.Time.milliseconds(200)
+        }
+      )
+
+    assert_receive {:rtsp_conn, camera_socket}, 5_000
+    assert_pipeline_notified(pid, :source, {:set_up_tracks, _tracks})
+    assert_pipeline_notified(pid, {:sink, "/in.h264"}, {:buffer, "/in.h264", pts_before}, 5_000)
+    source_pid = Membrane.Testing.Pipeline.get_child_pid!(pid, :source)
+
+    # The "camera" drops the connection mid-stream
+    :ok = :gen_tcp.close(camera_socket)
+
+    assert_receive {:rtsp_conn, _new_socket}, 5_000
+    assert Process.alive?(pid)
+    assert Membrane.Testing.Pipeline.get_child_pid!(pid, :source) == source_pid
+
+    # No second set_up_tracks: downstream keeps its pads and links
+    refute_pipeline_notified(pid, :source, {:set_up_tracks, _}, 500)
+
+    # Drain what was in flight, then media resumes with monotonic timestamps
+    pts_after = wait_for_pts_above(pid, pts_before, 10_000)
+    assert pts_after > pts_before
+
+    :ok = Membrane.Testing.Pipeline.terminate(pid)
+  end
+
+  defp wait_for_pts_above(pid, threshold, timeout) do
+    assert_pipeline_notified(pid, {:sink, "/in.h264"}, {:buffer, "/in.h264", pts}, timeout)
+    if pts > threshold, do: pts, else: wait_for_pts_above(pid, threshold, timeout)
   end
 
   test "stream specific media using tcp", %{server_port: port, tmp_dir: tmp_dir} do

@@ -6,7 +6,9 @@ defmodule Membrane.RTSP.Source do
   If there's no suitable depayloader and parser, the raw payload is sent to the subsequent elements in
   the pipeline.
 
-  In case connection can't be established or is severed during streaming this bin will crash.
+  In case connection can't be established this bin will crash. If the connection is severed
+  during streaming the bin crashes too, unless `reconnect_attempts` is set, in which case the
+  RTSP session is re-established in place and downstream keeps receiving the same tracks.
 
   The following codecs are depayloaded and parsed:
     * `H264`
@@ -82,6 +84,23 @@ defmodule Membrane.RTSP.Source do
                 - `:raise_error` - Raise an error.
                 - `:send_eos` - Send an `:end_of_stream` to the output pad.
                 """
+              ],
+              reconnect_attempts: [
+                spec: non_neg_integer(),
+                default: 0,
+                description: """
+                How many times to re-establish the RTSP session in place when it is lost
+                during streaming (keep-alive failure, server closing the connection, a
+                transport element crashing). Output pads and downstream links survive the
+                reconnect; timestamps stay monotonic. `0` keeps the crashing behaviour.
+                TCP transport only.
+                """
+              ],
+              reconnect_delay: [
+                spec: Time.t(),
+                default: Time.seconds(1),
+                default_inspector: &Time.pretty_duration/1,
+                description: "Delay before each reconnect attempt."
               ]
 
   def_output_pad :output,
@@ -101,7 +120,13 @@ defmodule Membrane.RTSP.Source do
             keep_alive_timer: reference() | nil,
             on_connection_closed: :raise_error | :send_eos,
             end_of_stream: boolean(),
-            play_request_sent: boolean()
+            play_request_sent: boolean(),
+            reconnect_attempts: non_neg_integer(),
+            reconnect_delay: Time.t(),
+            reconnects_left: non_neg_integer(),
+            session_gen: non_neg_integer(),
+            reconnect_timer: reference() | nil,
+            linked_tracks: %{String.t() => Membrane.Pad.ref()}
           }
 
     @enforce_keys [
@@ -114,12 +139,18 @@ defmodule Membrane.RTSP.Source do
     ]
     defstruct @enforce_keys ++
                 [
+                  reconnect_attempts: 0,
+                  reconnect_delay: Time.seconds(1),
                   tracks: [],
                   ssrc_to_track: %{},
                   rtsp_session: nil,
                   keep_alive_timer: nil,
                   end_of_stream: false,
-                  play_request_sent: false
+                  play_request_sent: false,
+                  reconnects_left: 0,
+                  session_gen: 0,
+                  reconnect_timer: nil,
+                  linked_tracks: %{}
                 ]
   end
 
@@ -127,15 +158,18 @@ defmodule Membrane.RTSP.Source do
   def handle_init(_ctx, options) do
     state = struct(State, Map.from_struct(options))
 
-    {[], state}
+    if state.reconnect_attempts > 0 and state.transport != :tcp do
+      raise ArgumentError, "reconnect_attempts is supported for TCP transport only"
+    end
+
+    {[], %{state | reconnects_left: state.reconnect_attempts}}
   end
 
   @impl true
   def handle_setup(ctx, state) do
     state = ConnectionManager.establish_connection(ctx.utility_supervisor, state)
 
-    {[spec: create_sources_spec(state), notify_parent: get_set_up_tracks_notification(state)],
-     state}
+    {[spec: session_spec(state), notify_parent: get_set_up_tracks_notification(state)], state}
   end
 
   @impl true
@@ -165,6 +199,16 @@ defmodule Membrane.RTSP.Source do
         {:DOWN, _ref, :process, rtsp_session, reason},
         ctx,
         %State{rtsp_session: rtsp_session} = state
+      )
+      when state.reconnects_left > 0 or state.reconnect_timer != nil do
+    session_lost({:rtsp_session_down, reason}, ctx, %{state | rtsp_session: nil})
+  end
+
+  @impl true
+  def handle_info(
+        {:DOWN, _ref, :process, rtsp_session, reason},
+        ctx,
+        %State{rtsp_session: rtsp_session} = state
       ) do
     case state.on_connection_closed do
       :send_eos ->
@@ -182,14 +226,42 @@ defmodule Membrane.RTSP.Source do
   end
 
   @impl true
-  def handle_info(:keep_alive, _ctx, state) do
+  def handle_info(:keep_alive, ctx, state) do
     if state.end_of_stream do
       {[], state}
     else
       case ConnectionManager.keep_alive(state) do
-        {:ok, state} -> {[], state}
-        {:error, reason} -> {[terminate: {:shutdown, {:keep_alive_failed, reason}}], state}
+        {:ok, state} ->
+          {[], state}
+
+        {:error, reason} when state.reconnects_left > 0 ->
+          session_lost({:keep_alive_failed, reason}, ctx, %{state | rtsp_session: nil})
+
+        {:error, reason} ->
+          {[terminate: {:shutdown, {:keep_alive_failed, reason}}], state}
       end
+    end
+  end
+
+  @impl true
+  def handle_info(:reconnect, ctx, state) do
+    state = %{state | reconnect_timer: nil, play_request_sent: false}
+    previous_tracks = state.tracks
+
+    case ConnectionManager.try_establish_connection(ctx.utility_supervisor, state) do
+      {:ok, state} ->
+        if track_signatures(state.tracks) == track_signatures(previous_tracks) do
+          Membrane.Logger.info("RTSP session re-established")
+          state = %{state | session_gen: state.session_gen + 1}
+
+          links = for {cp, _pad} <- state.linked_tracks, do: track_link_spec(cp, state)
+          {[spec: [session_spec(state) | links]], state}
+        else
+          {[terminate: {:shutdown, :rtsp_tracks_changed}], state}
+        end
+
+      {:error, reason, state} ->
+        session_lost({:reconnect_failed, reason}, ctx, state)
     end
   end
 
@@ -212,26 +284,121 @@ defmodule Membrane.RTSP.Source do
           {{:rtp_demuxer, track.control_path}, Time.milliseconds(200)}
       end
 
-    spec =
-      get_child(demuxer_name)
-      |> via_out(:output,
-        options: [
-          stream_id: {:payload_type, track.rtpmap.payload_type},
-          jitter_buffer_latency: jitter_buffer_latency,
-          clock_rate: track.rtpmap.clock_rate
-        ]
-      )
-      |> depayloader(track)
-      |> parser(track)
-      |> bin_output(pad)
+    if reconnect_enabled?(state) do
+      chain =
+        child({:funnel, control_path}, %Membrane.Funnel{end_of_stream: :never})
+        |> child({:continuity, control_path}, Source.Continuity)
+        |> depayloader(track)
+        |> parser(track)
+        |> bin_output(pad)
 
-    {[spec: spec], state}
+      state = put_in(state.linked_tracks[control_path], pad)
+      {[spec: [chain, track_link_spec(control_path, state)]], state}
+    else
+      spec =
+        get_child(demuxer_name)
+        |> via_out(:output,
+          options: [
+            stream_id: {:payload_type, track.rtpmap.payload_type},
+            jitter_buffer_latency: jitter_buffer_latency,
+            clock_rate: track.rtpmap.clock_rate
+          ]
+        )
+        |> depayloader(track)
+        |> parser(track)
+        |> bin_output(pad)
+
+      {[spec: spec], state}
+    end
   end
+
+  # The session group died (transport crash, or we removed it after the RTSP
+  # session was lost); schedule a reconnect or give up.
+  @impl true
+  def handle_crash_group_down({:rtsp_session, _gen}, ctx, state) do
+    session_lost({:rtsp_session_crashed, ctx.crash_reason}, ctx, %{state | rtsp_session: nil})
+  end
+
+  # A funnel loses its input when the session group dies; that is expected.
+  @impl true
+  def handle_child_pad_removed(_child, _pad, _ctx, state), do: {[], state}
 
   @impl true
   def handle_terminate_request(_ctx, state) do
     ConnectionManager.teardown(state)
     {[terminate: :normal], state}
+  end
+
+  defp reconnect_enabled?(state), do: state.reconnect_attempts > 0
+
+  defp session_spec(state) do
+    if reconnect_enabled?(state),
+      do:
+        {create_sources_spec(state),
+         group: {:rtsp_session, state.session_gen}, crash_group_mode: :temporary},
+      else: create_sources_spec(state)
+  end
+
+  defp track_link_spec(control_path, state) do
+    track = Enum.find(state.tracks, &(&1.control_path == control_path))
+
+    get_child(:rtp_demuxer)
+    |> via_out(:output,
+      options: [
+        stream_id: {:payload_type, track.rtpmap.payload_type},
+        jitter_buffer_latency: 0,
+        clock_rate: track.rtpmap.clock_rate
+      ]
+    )
+    |> via_in(Pad.ref(:input, state.session_gen))
+    |> get_child({:funnel, control_path})
+  end
+
+  defp session_lost(_reason, _ctx, %{reconnect_timer: timer} = state) when timer != nil,
+    do: {[], state}
+
+  defp session_lost(reason, ctx, %{reconnects_left: 0} = state) do
+    {[terminate: {:shutdown, reason}], cancel_keep_alive(state) |> drop_session(ctx)}
+  end
+
+  defp session_lost(reason, ctx, state) do
+    Membrane.Logger.warning(
+      "RTSP session lost (#{inspect(reason)}), reconnecting in #{Time.pretty_duration(state.reconnect_delay)}"
+    )
+
+    timer =
+      Process.send_after(self(), :reconnect, Time.as_milliseconds(state.reconnect_delay, :round))
+
+    state = %{
+      cancel_keep_alive(state)
+      | reconnect_timer: timer,
+        reconnects_left: state.reconnects_left - 1
+    }
+
+    remove =
+      for name <- [:tcp_source, :tcp_decapsulator, :rtp_demuxer],
+          Map.has_key?(ctx.children, name),
+          do: name
+
+    if state.rtsp_session, do: ConnectionManager.teardown(state)
+    {if(remove == [], do: [], else: [remove_children: remove]), %{state | rtsp_session: nil}}
+  end
+
+  defp drop_session(state, _ctx), do: %{state | rtsp_session: nil}
+
+  defp cancel_keep_alive(%{keep_alive_timer: nil} = state), do: state
+
+  defp cancel_keep_alive(state) do
+    Process.cancel_timer(state.keep_alive_timer)
+    %{state | keep_alive_timer: nil}
+  end
+
+  defp track_signatures(tracks) do
+    tracks
+    |> Enum.map(
+      &{&1.control_path, &1.type, &1.rtpmap && {&1.rtpmap.payload_type, &1.rtpmap.encoding}}
+    )
+    |> Enum.sort()
   end
 
   @spec get_set_up_tracks_notification(State.t()) :: set_up_tracks_notification()
